@@ -8,7 +8,10 @@
 #include <libremidi/message.hpp>
 #include <libremidi/ump.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <vector>
 
 NAMESPACE_LIBREMIDI
 {
@@ -334,6 +337,102 @@ struct midi2_to_midi1
   }();
 
   uint8_t midi[65536];
+};
+
+//! Reassembles SysEx7 packets (UMP message type 0x3) into complete MIDI 1.0
+//! SysEx messages, F0 <data> F7.
+//!
+//! midi2_to_midi1 only joins the packets it is given in one call. A SysEx
+//! split over several packets that arrive one per call (an input decoder
+//! delivers one UMP at a time) must be collected across calls first. Each
+//! group carries its own SysEx7 stream.
+struct sysex7_to_midi1
+{
+  //! A message whose data grows past this many bytes is dropped.
+  static constexpr std::size_t max_bytes = 1024 * 1024;
+
+  //! Takes one SysEx7 packet (two words). When it completes a message, calls
+  //! on_sysex(const uint8_t* midi, std::size_t n, int64_t timestamp) with the
+  //! timestamp of the message's first packet.
+  //! A Continue or End packet without a Start is dropped; a Start abandons an
+  //! unfinished message of the same group.
+  void convert(const uint32_t* ump, int64_t timestamp, auto on_sysex)
+  {
+    auto& s = streams[(ump[0] >> 24) & 0xF];
+    switch (cmidi2_ump_get_status_code(ump))
+    {
+      case CMIDI2_SYSEX_IN_ONE_UMP:
+        s.begin(timestamp);
+        s.append(ump);
+        s.end(on_sysex);
+        break;
+      case CMIDI2_SYSEX_START:
+        s.begin(timestamp);
+        s.append(ump);
+        break;
+      case CMIDI2_SYSEX_CONTINUE:
+        s.append(ump);
+        break;
+      case CMIDI2_SYSEX_END:
+        s.append(ump);
+        s.end(on_sysex);
+        break;
+      default:
+        s.reset();
+        break;
+    }
+  }
+
+private:
+  struct stream
+  {
+    std::vector<uint8_t> bytes;
+    int64_t timestamp{};
+    bool active{};
+
+    void begin(int64_t ts)
+    {
+      bytes.assign(1, 0xF0);
+      timestamp = ts;
+      active = true;
+    }
+
+    void append(const uint32_t* ump)
+    {
+      if (!active)
+        return;
+
+      // At most 6 data bytes per packet; a larger count is malformed.
+      const std::size_t n = std::min<std::size_t>((ump[0] >> 16) & 0xF, 6);
+      if (bytes.size() - 1 + n > max_bytes)
+      {
+        reset();
+        return;
+      }
+
+      const uint8_t data[6]{
+          uint8_t(ump[0] >> 8), uint8_t(ump[0]),       uint8_t(ump[1] >> 24),
+          uint8_t(ump[1] >> 16), uint8_t(ump[1] >> 8), uint8_t(ump[1])};
+      bytes.insert(bytes.end(), data, data + n);
+    }
+
+    void end(auto& on_sysex)
+    {
+      if (!active)
+        return;
+      bytes.push_back(0xF7);
+      on_sysex(bytes.data(), bytes.size(), timestamp);
+      reset();
+    }
+
+    void reset()
+    {
+      bytes.clear();
+      active = false;
+    }
+  };
+
+  std::array<stream, 16> streams{};
 };
 
 }
