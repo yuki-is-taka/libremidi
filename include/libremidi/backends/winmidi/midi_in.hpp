@@ -2,6 +2,7 @@
 #include <libremidi/backends/winmidi/config.hpp>
 #include <libremidi/backends/winmidi/helpers.hpp>
 #include <libremidi/backends/winmidi/observer.hpp>
+#include <libremidi/backends/winmidi/ump_batch.hpp>
 #include <libremidi/detail/midi_in.hpp>
 #include <libremidi/detail/midi_stream_decoder.hpp>
 
@@ -108,8 +109,9 @@ public:
     // the UMP group index the block spans. For example a USB MIDI 1.0 device may expose
     // its input GTB as Number()==2 while its messages arrive on group 0. Using
     // `port.port - 1` as the group filter therefore silently drops all input from such
-    // devices. Filter on the resolved block's actual first group instead.
-    m_group_filter = gp.FirstGroup().Index();
+    // devices. Filter on the groups the resolved block actually spans instead:
+    // [FirstGroup, FirstGroup + GroupCount).
+    m_groups = {.enabled = true, .first = gp.FirstGroup().Index(), .count = gp.GroupCount()};
 
     try
     {
@@ -151,6 +153,9 @@ public:
     using namespace winrt::Microsoft::Windows::Devices::Midi2::Endpoints::Virtual;
 
     auto conf = setup_virtualdevice_config(configuration.client_name, port_name, port_name, MidiFunctionBlockDirection::BlockInput);
+
+    // A virtual port receives every group.
+    m_groups = {};
 
     m_virtual = MidiVirtualDeviceManager::CreateVirtualDevice(conf);
     if (m_virtual == nullptr)
@@ -197,30 +202,16 @@ public:
   void process_message(
       const winrt::Microsoft::Windows::Devices::Midi2::MidiMessageReceivedEventArgs& msg)
   {
-    static constexpr timestamp_backend_info timestamp_info{
-        .has_absolute_timestamps = true,
-        .absolute_is_monotonic = false,
-        .has_samples = false,
-    };
-
     const auto& ump = msg.GetMessagePacket();
-    auto pk = msg.PeekFirstWord();
-    if (m_group_filter >= 0)
-    {
-      int group = cmidi2_ump_get_group(&pk);
-      if (group != m_group_filter)
-        return;
-    }
-
     const auto& b = ump.GetAllWords();
 
     uint32_t ump_space[64];
     array_view<uint32_t> ref{ump_space};
     b.GetMany(0, ref);
 
-    auto to_ns = [this, t = ump.Timestamp()] { return ticks_to_ns(t); };
-    m_processing.on_bytes(
-        {ump_space, ump_space + b.Size()}, m_processing.timestamp<timestamp_info>(to_ns, 0));
+    const auto ns = ticks_to_ns(ump.Timestamp());
+    dispatch_ump_batch(
+        m_processing, {ump_space, ump_space + b.Size()}, m_groups, [ns] { return ns; });
   }
 
 #if LIBREMIDI_WINMIDI_HAS_COM_EXTENSIONS
@@ -231,25 +222,9 @@ public:
       UINT32 wordCount,
       UINT32 *ump)
   {
-    static constexpr timestamp_backend_info timestamp_info{
-        .has_absolute_timestamps = true,
-        .absolute_is_monotonic = false,
-        .has_samples = false,
-    };
-
-    if(wordCount == 0)
-      return;
-
-    if (m_group_filter >= 0)
-    {
-      int group = cmidi2_ump_get_group(ump);
-      if (group != m_group_filter)
-        return;
-    }
-
-    auto to_ns = [this, t = timestamp] { return ticks_to_ns(t); };
-    m_processing.on_bytes(
-        {ump, ump + wordCount}, m_processing.timestamp<timestamp_info>(to_ns, 0));
+    // One service timestamp per batch, converted once.
+    const auto ns = ticks_to_ns(timestamp);
+    dispatch_ump_batch(m_processing, {ump, ump + wordCount}, m_groups, [ns] { return ns; });
   }
 #endif
 
@@ -270,6 +245,7 @@ public:
       m_endpoint.MessageReceived(m_revoke_token);
 
     m_session.DisconnectEndpointConnection(m_endpoint.ConnectionId());
+    m_groups = {};
 
 #if LIBREMIDI_WINMIDI_HAS_VIRTUAL_DEVICE
     if (m_virtual)
@@ -294,7 +270,7 @@ private:
   winrt::Microsoft::Windows::Devices::Midi2::Endpoints::Virtual::MidiVirtualDevice m_virtual{nullptr};
 #endif
   midi2::input_state_machine m_processing{this->configuration};
-  int m_group_filter = -1;
+  ump_group_filter m_groups{};
   std::uint64_t m_tick_frequency_hz{};
 };
 }
