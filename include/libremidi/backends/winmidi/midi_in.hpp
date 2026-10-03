@@ -109,7 +109,8 @@ public:
     // the UMP group index the block spans. For example a USB MIDI 1.0 device may expose
     // its input GTB as Number()==2 while its messages arrive on group 0. Using
     // `port.port - 1` as the group filter therefore silently drops all input from such
-    // devices. Filter on the resolved block's actual first group instead.
+    // devices. Filter on the groups the resolved block actually spans instead:
+    // [FirstGroup, FirstGroup + GroupCount).
     m_groups = {.enabled = true, .first = gp.FirstGroup().Index(), .count = gp.GroupCount()};
 
     try

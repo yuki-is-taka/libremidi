@@ -45,6 +45,14 @@ constexpr bool ump_has_group(uint32_t w0) noexcept
   }
 }
 
+//! Whether a UMP's group lies in [first, first + count), from its first word.
+//! Meaningful only when ump_has_group(w0).
+constexpr bool ump_group_in_range(uint32_t w0, unsigned first, unsigned count) noexcept
+{
+  const unsigned g = (w0 >> 24) & 0xF;
+  return g >= first && g < first + count;
+}
+
 //! The UMP groups an opened input port covers: [first, first + count).
 //! Disabled on virtual ports.
 struct ump_group_filter
@@ -55,15 +63,14 @@ struct ump_group_filter
 
   //! The verdict for one message, from its first word.
   //! - A port without a filter (virtual) receives everything.
-  //! - A group-filtered port receives only messages that carry a group of
-  //!   its own; groupless and reserved message types are not routed to it.
+  //! - A group-filtered port receives only messages that carry a group in
+  //!   its block's range; groupless and reserved message types are not
+  //!   routed to it.
   constexpr bool accepts(uint32_t w0) const noexcept
   {
     if (!enabled)
       return true;
-    if (!ump_has_group(w0))
-      return false;
-    return ((w0 >> 24) & 0xF) == first;
+    return ump_has_group(w0) && ump_group_in_range(w0, first, count);
   }
 };
 
