@@ -14,13 +14,19 @@ LIBREMIDI_STATIC_IMPLEMENTATION libremidi::ump_input_configuration
 convert_midi1_to_midi2_input_configuration(const input_configuration& base_conf) noexcept
 {
   libremidi::ump_input_configuration c2;
-  c2.on_message = [cb = base_conf.on_message,
-                   converter = midi2_to_midi1{}](libremidi::ump&& msg) mutable -> void {
-    converter.convert(
-        msg.data, 1, msg.timestamp, [cb](const unsigned char* midi, std::size_t n, int64_t ts) {
+  c2.on_message = [cb = base_conf.on_message, converter = midi2_to_midi1{},
+                   sysex = sysex7_to_midi1{}](libremidi::ump&& msg) mutable -> void {
+    auto on_midi = [&cb](const unsigned char* midi, std::size_t n, int64_t ts) {
       cb(libremidi::message{{midi, midi + n}, ts});
       return stdx::error{};
-    });
+    };
+
+    // The decoder hands over one UMP at a time, so a SysEx split over several
+    // packets is collected across calls before it reaches the MIDI 1 user.
+    if (cmidi2_ump_get_message_type(msg.data) == CMIDI2_MESSAGE_TYPE_SYSEX7)
+      sysex.convert(msg.data, msg.timestamp, on_midi);
+    else
+      converter.convert(msg.data, 1, msg.timestamp, on_midi);
   };
   c2.get_timestamp = base_conf.get_timestamp;
   c2.on_error = base_conf.on_error;
