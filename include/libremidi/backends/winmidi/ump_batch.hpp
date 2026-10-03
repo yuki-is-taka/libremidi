@@ -18,6 +18,33 @@ static constexpr timestamp_backend_info input_timestamp_info{
     .has_samples = false,
 };
 
+//! Whether a UMP carries a group in bits 27..24, from its first word.
+//! UMP 1.1 message types with a group: 0x1 system, 0x2 MIDI 1.0 channel
+//! voice, 0x3 SysEx7, 0x4 MIDI 2.0 channel voice, 0x5 SysEx8 and mixed data
+//! set, 0xD flex data. Without one:
+//! - 0x0 utility messages, which the UMP specification defines as groupless;
+//! - 0xF UMP stream messages, which address the whole endpoint ("messages
+//!   with no group ... describe the whole endpoint, not a cable",
+//!   Microsoft, "Porting a MIDI library");
+//! - the reserved types 0x6-0xC and 0xE: their bits 27..24 have no defined
+//!   meaning yet. Treating them as groupless is this library's forward-
+//!   compatibility policy, not a rule from the specification.
+constexpr bool ump_has_group(uint32_t w0) noexcept
+{
+  switch (w0 >> 28)
+  {
+    case 0x1:
+    case 0x2:
+    case 0x3:
+    case 0x4:
+    case 0x5:
+    case 0xD:
+      return true;
+    default:
+      return false;
+  }
+}
+
 //! The UMP groups an opened input port covers: [first, first + count).
 //! Disabled on virtual ports.
 struct ump_group_filter
@@ -27,10 +54,15 @@ struct ump_group_filter
   uint8_t count{};
 
   //! The verdict for one message, from its first word.
+  //! - A port without a filter (virtual) receives everything.
+  //! - A group-filtered port receives only messages that carry a group of
+  //!   its own; groupless and reserved message types are not routed to it.
   constexpr bool accepts(uint32_t w0) const noexcept
   {
     if (!enabled)
       return true;
+    if (!ump_has_group(w0))
+      return false;
     return ((w0 >> 24) & 0xF) == first;
   }
 };
