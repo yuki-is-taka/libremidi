@@ -61,6 +61,9 @@ target_link_libraries(observer_filters_test PRIVATE libremidi Catch2::Catch2With
 add_executable(winmidi_ump_batch_test tests/unit/winmidi_ump_batch.cpp)
 target_link_libraries(winmidi_ump_batch_test PRIVATE libremidi Catch2::Catch2WithMain)
 
+add_executable(winmidi_output_group_test tests/unit/winmidi_output_group.cpp)
+target_link_libraries(winmidi_output_group_test PRIVATE libremidi Catch2::Catch2WithMain)
+
 include(CTest)
 add_test(NAME conversion_test COMMAND conversion_test)
 add_test(NAME error_test COMMAND error_test)
@@ -75,6 +78,7 @@ add_test(NAME midi_timing_test COMMAND midi_timing_test)
 add_test(NAME rawio_test COMMAND rawio_test)
 add_test(NAME observer_filters_test COMMAND observer_filters_test)
 add_test(NAME winmidi_ump_batch_test COMMAND winmidi_ump_batch_test)
+add_test(NAME winmidi_output_group_test COMMAND winmidi_output_group_test)
 
 # PipeWire shared-context regression tests. Standalone programs (no Catch2):
 # each skips with exit 0 when no daemon is reachable and arms a watchdog so a
