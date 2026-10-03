@@ -1,6 +1,7 @@
 #include "../include_catch.hpp"
 
 #include <libremidi/detail/midi_stream_decoder.hpp>
+#include <libremidi/detail/ump_stream.hpp>
 
 #include <vector>
 
@@ -482,6 +483,65 @@ TEST_CASE("midi2: multiple UMP messages via on_bytes_multi", "[midi2][state_mach
   }
 }
 
+TEST_CASE("midi2: reserved message types are sized and skipped", "[midi2][state_machine]")
+{
+  // UMP 1.1, 2.1.4: every message type has a size, the reserved ones
+  // included, so a receiver can skip what it does not understand.
+  midi2_collector c;
+  auto sm = c.make_state_machine();
+
+  SECTION("128 bits, type 0xE")
+  {
+    uint32_t words[] = {0xE0000000, 0x12345678, 0x9ABCDEF0, 0x40903C00, make_ump_system(0xFA)};
+    sm.on_bytes_multi(std::span<const uint32_t>(words), 0);
+
+    REQUIRE(c.messages.size() == 2);
+    REQUIRE(c.messages[0].data[0] == 0xE0000000);
+    REQUIRE(c.messages[0].data[3] == 0x40903C00);
+    REQUIRE(c.messages[1].data[0] == make_ump_system(0xFA));
+  }
+
+  SECTION("96 bits, type 0xB")
+  {
+    uint32_t words[] = {0xB0000000, 1, 2, make_ump_system(0xFA)};
+    sm.on_bytes_multi(std::span<const uint32_t>(words), 0);
+
+    REQUIRE(c.messages.size() == 2);
+    REQUIRE(c.messages[1].data[0] == make_ump_system(0xFA));
+  }
+
+  SECTION("64 bits, type 0x8")
+  {
+    uint32_t words[] = {0x80000000, 1, make_ump_system(0xFA)};
+    sm.on_bytes_multi(std::span<const uint32_t>(words), 0);
+
+    REQUIRE(c.messages.size() == 2);
+    REQUIRE(c.messages[1].data[0] == make_ump_system(0xFA));
+  }
+
+  SECTION("32 bits, type 0x6")
+  {
+    uint32_t words[] = {0x60000000, make_ump_system(0xFA)};
+    sm.on_bytes_multi(std::span<const uint32_t>(words), 0);
+
+    REQUIRE(c.messages.size() == 2);
+    REQUIRE(c.messages[1].data[0] == make_ump_system(0xFA));
+  }
+}
+
+TEST_CASE("midi2: a packet cut short by the buffer is dropped", "[midi2][state_machine]")
+{
+  midi2_collector c;
+  auto sm = c.make_state_machine();
+
+  // A system message, then the first word of a 64 bit voice message.
+  uint32_t words[] = {make_ump_system(0xFA), make_ump_midi2_note_on(60, 0xFFFF)};
+  sm.on_bytes_multi(std::span<const uint32_t>(words), 0);
+
+  REQUIRE(c.messages.size() == 1);
+  REQUIRE(c.messages[0].data[0] == make_ump_system(0xFA));
+}
+
 TEST_CASE("midi2: MIDI 1 channel voice upscaling", "[midi2][state_machine]")
 {
   SECTION("upscale enabled: MIDI 1 channel voice becomes MIDI 2")
@@ -625,4 +685,59 @@ TEST_CASE("midi2: raw_data callback", "[midi2][state_machine]")
   // on_raw_data gets the entire buffer as-is
   REQUIRE(raw_received.size() == 1);
   REQUIRE(raw_received[0].size() == 2);
+}
+
+// ============================================================================
+// Bounds: spans longer or shorter than one UMP
+// ============================================================================
+
+TEST_CASE("midi2: a span longer than one UMP through on_bytes stays in bounds", "[midi2][state_machine]")
+{
+  // on_bytes takes at most one message. A Windows MIDI Services callback may
+  // hand over several messages at once; the copy into ump::data[4] must not
+  // run past the struct. This asserts memory safety only (run under ASan):
+  // splitting the span into messages is the caller's job.
+  midi2_collector c;
+  auto sm = c.make_state_machine();
+
+  // Four SysEx7 packets: Start, Continue, Continue, End (8 words).
+  const uint32_t words[]
+      = {0x30160021, 0x1D010101, 0x30260A01, 0x02030405,
+         0x30260607, 0x08090A0B, 0x30310C00, 0x00000000};
+
+  SECTION("6 words")
+  {
+    sm.on_bytes(std::span<const uint32_t>(words, 6), 12345);
+    REQUIRE(c.messages.size() == 1);
+    REQUIRE(c.messages[0].data[0] == words[0]);
+    REQUIRE(c.messages[0].data[3] == words[3]);
+    REQUIRE(c.messages[0].timestamp == 12345);
+  }
+
+  SECTION("8 words")
+  {
+    sm.on_bytes(std::span<const uint32_t>(words, 8), 12345);
+    REQUIRE(c.messages.size() == 1);
+    REQUIRE(c.messages[0].data[0] == words[0]);
+    REQUIRE(c.messages[0].data[3] == words[3]);
+    REQUIRE(c.messages[0].timestamp == 12345);
+  }
+}
+
+TEST_CASE("segment_ump_stream: a packet cut short by the buffer is not sent", "[ump_stream]")
+{
+  // The first word of a 64-bit MIDI 2.0 Note On, without its second word.
+  // Heap-allocated so ASan sees a read past the end.
+  std::vector<uint32_t> buf{0x40903C00};
+  std::vector<std::vector<uint32_t>> written;
+
+  auto err = libremidi::segment_ump_stream(
+      buf.data(), static_cast<int64_t>(buf.size()),
+      [&](const uint32_t* ump, int64_t bytes) -> std::errc {
+    written.emplace_back(ump, ump + bytes / 4);
+    return std::errc{};
+  }, [] { });
+
+  REQUIRE(written.empty());
+  REQUIRE(err == stdx::error{});
 }
