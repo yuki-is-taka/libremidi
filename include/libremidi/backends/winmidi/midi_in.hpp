@@ -153,6 +153,9 @@ public:
 
     auto conf = setup_virtualdevice_config(configuration.client_name, port_name, port_name, MidiFunctionBlockDirection::BlockInput);
 
+    // A virtual port receives every group.
+    m_groups = {};
+
     m_virtual = MidiVirtualDeviceManager::CreateVirtualDevice(conf);
     if (m_virtual == nullptr)
       return std::errc::device_or_resource_busy;
@@ -205,8 +208,9 @@ public:
     array_view<uint32_t> ref{ump_space};
     b.GetMany(0, ref);
 
-    auto to_ns = [this, t = ump.Timestamp()] { return ticks_to_ns(t); };
-    dispatch_ump_batch(m_processing, {ump_space, ump_space + b.Size()}, m_groups, to_ns);
+    const auto ns = ticks_to_ns(ump.Timestamp());
+    dispatch_ump_batch(
+        m_processing, {ump_space, ump_space + b.Size()}, m_groups, [ns] { return ns; });
   }
 
 #if LIBREMIDI_WINMIDI_HAS_COM_EXTENSIONS
@@ -217,8 +221,9 @@ public:
       UINT32 wordCount,
       UINT32 *ump)
   {
-    auto to_ns = [this, t = timestamp] { return ticks_to_ns(t); };
-    dispatch_ump_batch(m_processing, {ump, ump + wordCount}, m_groups, to_ns);
+    // One service timestamp per batch, converted once.
+    const auto ns = ticks_to_ns(timestamp);
+    dispatch_ump_batch(m_processing, {ump, ump + wordCount}, m_groups, [ns] { return ns; });
   }
 #endif
 
@@ -239,6 +244,7 @@ public:
       m_endpoint.MessageReceived(m_revoke_token);
 
     m_session.DisconnectEndpointConnection(m_endpoint.ConnectionId());
+    m_groups = {};
 
 #if LIBREMIDI_WINMIDI_HAS_VIRTUAL_DEVICE
     if (m_virtual)
