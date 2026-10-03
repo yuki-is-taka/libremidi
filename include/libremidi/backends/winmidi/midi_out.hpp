@@ -2,6 +2,7 @@
 #include <libremidi/backends/winmidi/config.hpp>
 #include <libremidi/backends/winmidi/helpers.hpp>
 #include <libremidi/backends/winmidi/observer.hpp>
+#include <libremidi/backends/winmidi/ump_batch.hpp>
 #include <libremidi/detail/midi_out.hpp>
 #include <libremidi/detail/ump_stream.hpp>
 
@@ -46,6 +47,14 @@ public:
     if (!ep || !gp)
       return std::errc::address_not_available;
 
+    // The service has no destination parameter: the group in each message
+    // selects the cable. See ump_output_group for the (interim) policy.
+    set_group(
+        {.enabled = true,
+         .first = gp.FirstGroup().Index(),
+         .count = gp.GroupCount(),
+         .receivable = receivable_groups(ep)});
+
     try
     {
       m_endpoint = m_session.CreateEndpointConnection(ep.EndpointDeviceId());
@@ -72,6 +81,9 @@ public:
     using namespace winrt::Microsoft::Windows::Devices::Midi2::Endpoints::Virtual;
 
     auto conf = setup_virtualdevice_config(configuration.client_name, port_name, port_name, MidiFunctionBlockDirection::BlockOutput);
+
+    // A virtual port sends every message as given.
+    set_group({});
 
     m_virtual = MidiVirtualDeviceManager::CreateVirtualDevice(conf);
     if (m_virtual == nullptr)
@@ -102,6 +114,7 @@ public:
       return std::errc::not_connected;
 
     m_session.DisconnectEndpointConnection(m_endpoint.ConnectionId());
+    set_group({});
 #if LIBREMIDI_WINMIDI_HAS_VIRTUAL_DEVICE
     if (m_virtual)
     {
@@ -181,7 +194,10 @@ public:
 
       return segment_ump_stream(message, size,
                                 [this](const uint32_t* ump, int64_t bytes) -> std::errc {
-        return write(ump, bytes);
+        return write_with_group(
+            m_group, ump, bytes,
+            [this](const uint32_t* u, int64_t b) { return write(u, b); },
+            [this](ump_output_group::action a) { report_group(a); });
       }, []() { });
     }
     else
@@ -189,12 +205,77 @@ public:
     {
       return segment_ump_stream(message, size,
                                 [this](const uint32_t* ump, int64_t bytes) -> std::errc {
-        return write_raw(ump, bytes);
+        return write_with_group(
+            m_group, ump, bytes,
+            [this](const uint32_t* u, int64_t b) { return write_raw(u, b); },
+            [this](ump_output_group::action a) { report_group(a); });
       }, []() { });
     }
   }
 
 private:
+  // The groups the endpoint receives from the host. A block's direction is
+  // its own: BlockInput (or Bidirectional) receives. Function blocks when the
+  // endpoint declares them, group terminal blocks otherwise; the two are never
+  // merged.
+  static uint16_t receivable_groups(const MidiEndpointDeviceInformation& ep)
+  {
+    uint16_t mask = 0;
+    const auto fbs = ep.GetDeclaredFunctionBlocks();
+    if (fbs.Size() > 0)
+    {
+      for (const auto& fb : fbs)
+        if (fb.Direction() != MidiFunctionBlockDirection::BlockOutput)
+          mask = static_cast<uint16_t>(
+              mask | ump_group_mask(fb.FirstGroup().Index(), fb.GroupCount()));
+    }
+    else
+    {
+      for (const auto& gtb : ep.GetGroupTerminalBlocks())
+        if (gtb.Direction() != MidiGroupTerminalBlockDirection::BlockOutput)
+          mask = static_cast<uint16_t>(
+              mask | ump_group_mask(gtb.FirstGroup().Index(), gtb.GroupCount()));
+    }
+    return mask;
+  }
+
+  // Applies a port's group to both send paths: UMP (send_ump) and MIDI 1.0
+  // bytes (send_message converts them with this->converter, then calls
+  // send_ump). Reports are re-armed for each open.
+  void set_group(const ump_output_group& group)
+  {
+    m_group = group;
+    this->converter.context.group = group.midi1_group();
+    m_reported_restamp = false;
+    m_reported_unverified = false;
+  }
+
+  // Each kind of group change is reported once per open.
+  void report_group(ump_output_group::action a)
+  {
+    if (a == ump_output_group::action::restamp && !m_reported_restamp)
+    {
+      m_reported_restamp = true;
+      libremidi_handle_warning(
+          this->configuration,
+          "winmidi: a message's group is outside the output port's block; it is sent on the "
+          "block's first group (reported once per open)");
+    }
+    else if (a == ump_output_group::action::send_unverified && !m_reported_unverified)
+    {
+      m_reported_unverified = true;
+      libremidi_handle_warning(
+          this->configuration,
+          "winmidi: a message's group is outside the output port's block, and no "
+          "host-to-device block of the endpoint covers the block's first group; it is sent "
+          "unchanged (reported once per open)");
+    }
+  }
+
+  ump_output_group m_group{};
+  bool m_reported_restamp{};
+  bool m_reported_unverified{};
+
   MidiSession m_session;
   winrt::Microsoft::Windows::Devices::Midi2::MidiEndpointConnection m_endpoint{nullptr};
 #if LIBREMIDI_WINMIDI_HAS_COM_EXTENSIONS
