@@ -2,6 +2,7 @@
 #include <libremidi/backends/winmidi/config.hpp>
 #include <libremidi/backends/winmidi/helpers.hpp>
 #include <libremidi/backends/winmidi/observer.hpp>
+#include <libremidi/backends/winmidi/ump_batch.hpp>
 #include <libremidi/detail/midi_in.hpp>
 #include <libremidi/detail/midi_stream_decoder.hpp>
 
@@ -109,7 +110,7 @@ public:
     // its input GTB as Number()==2 while its messages arrive on group 0. Using
     // `port.port - 1` as the group filter therefore silently drops all input from such
     // devices. Filter on the resolved block's actual first group instead.
-    m_group_filter = gp.FirstGroup().Index();
+    m_groups = {.enabled = true, .first = gp.FirstGroup().Index(), .count = gp.GroupCount()};
 
     try
     {
@@ -197,21 +198,7 @@ public:
   void process_message(
       const winrt::Microsoft::Windows::Devices::Midi2::MidiMessageReceivedEventArgs& msg)
   {
-    static constexpr timestamp_backend_info timestamp_info{
-        .has_absolute_timestamps = true,
-        .absolute_is_monotonic = false,
-        .has_samples = false,
-    };
-
     const auto& ump = msg.GetMessagePacket();
-    auto pk = msg.PeekFirstWord();
-    if (m_group_filter >= 0)
-    {
-      int group = cmidi2_ump_get_group(&pk);
-      if (group != m_group_filter)
-        return;
-    }
-
     const auto& b = ump.GetAllWords();
 
     uint32_t ump_space[64];
@@ -219,8 +206,7 @@ public:
     b.GetMany(0, ref);
 
     auto to_ns = [this, t = ump.Timestamp()] { return ticks_to_ns(t); };
-    m_processing.on_bytes(
-        {ump_space, ump_space + b.Size()}, m_processing.timestamp<timestamp_info>(to_ns, 0));
+    dispatch_ump_batch(m_processing, {ump_space, ump_space + b.Size()}, m_groups, to_ns);
   }
 
 #if LIBREMIDI_WINMIDI_HAS_COM_EXTENSIONS
@@ -231,25 +217,8 @@ public:
       UINT32 wordCount,
       UINT32 *ump)
   {
-    static constexpr timestamp_backend_info timestamp_info{
-        .has_absolute_timestamps = true,
-        .absolute_is_monotonic = false,
-        .has_samples = false,
-    };
-
-    if(wordCount == 0)
-      return;
-
-    if (m_group_filter >= 0)
-    {
-      int group = cmidi2_ump_get_group(ump);
-      if (group != m_group_filter)
-        return;
-    }
-
     auto to_ns = [this, t = timestamp] { return ticks_to_ns(t); };
-    m_processing.on_bytes(
-        {ump, ump + wordCount}, m_processing.timestamp<timestamp_info>(to_ns, 0));
+    dispatch_ump_batch(m_processing, {ump, ump + wordCount}, m_groups, to_ns);
   }
 #endif
 
@@ -294,7 +263,7 @@ private:
   winrt::Microsoft::Windows::Devices::Midi2::Endpoints::Virtual::MidiVirtualDevice m_virtual{nullptr};
 #endif
   midi2::input_state_machine m_processing{this->configuration};
-  int m_group_filter = -1;
+  ump_group_filter m_groups{};
   std::uint64_t m_tick_frequency_hz{};
 };
 }

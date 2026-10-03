@@ -108,6 +108,7 @@ target_sources(libremidi PRIVATE
     include/libremidi/backends/winmidi/midi_in.hpp
     include/libremidi/backends/winmidi/midi_out.hpp
     include/libremidi/backends/winmidi/observer.hpp
+    include/libremidi/backends/winmidi/ump_batch.hpp
     include/libremidi/backends/winmidi.hpp
 
     include/libremidi/backends/winmm/config.hpp
