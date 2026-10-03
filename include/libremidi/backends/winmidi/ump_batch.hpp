@@ -1,13 +1,16 @@
 #pragma once
-// The WinRT-free part of the Windows MIDI Services input: what happens to a
-// batch of UMP words the service hands to an opened port. It includes no
-// WinRT header, so it compiles and is unit-tested on every platform.
+// The WinRT-free part of the Windows MIDI Services backend: what happens to a
+// batch of UMP words the service hands to an opened input port, and the group
+// an output port stamps on what it sends. It includes no WinRT header, so it
+// compiles and is unit-tested on every platform.
 
 #include <libremidi/cmidi2.hpp>
 #include <libremidi/detail/midi_stream_decoder.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <span>
+#include <system_error>
 
 NAMESPACE_LIBREMIDI::winmidi
 {
@@ -134,5 +137,101 @@ inline void dispatch_ump_batch(
       processing.on_bytes(message, processing.timestamp<input_timestamp_info>(to_ns, 0));
   },
       size);
+}
+
+//! Bits [first, first + count) of a 16-bit group mask, clipped to 16 groups.
+constexpr uint16_t ump_group_mask(unsigned first, unsigned count) noexcept
+{
+  uint32_t mask = 0;
+  for (unsigned g = first; g < first + count && g < 16; g++)
+    mask |= 1u << g;
+  return static_cast<uint16_t>(mask);
+}
+
+//! A UMP's first word with its group (bits 27..24) replaced.
+constexpr uint32_t ump_with_group(uint32_t w0, uint8_t group) noexcept
+{
+  return (w0 & 0xF0FFFFFFu) | (uint32_t(group & 0xF) << 24);
+}
+
+//! The group an opened output port stamps on what it sends.
+//!
+//! Windows MIDI Services has no destination parameter: the group in each
+//! message selects the cable ("Set the group in the message itself",
+//! Microsoft, "Porting a MIDI library"). A port is the endpoint plus the
+//! groups of the block it was opened on.
+//!
+//! INTERIM, until the port-identity redesign makes every port exactly one
+//! group: a message whose group lies inside the block passes unchanged; one
+//! outside it is restamped to the block's first group. Because the backend
+//! can resolve an output port to a block of the opposite direction, the
+//! restamp only happens when a host-to-device block of the endpoint covers
+//! that group; otherwise the message goes out unchanged, as before.
+struct ump_output_group
+{
+  //! false on virtual ports: everything goes out as given.
+  bool enabled{};
+  uint8_t first{};
+  uint8_t count{};
+  //! The groups the endpoint receives from the host (host-to-device blocks).
+  uint16_t receivable{};
+
+  enum class action : uint8_t
+  {
+    send,           //!< unchanged: in the block, groupless, or no filter
+    restamp,        //!< outside the block: sent on the block's first group
+    send_unverified //!< outside the block, but the endpoint does not receive
+                    //!< the block's first group: unchanged
+  };
+
+  constexpr bool first_is_receivable() const noexcept
+  {
+    return first < 16 && ((receivable >> first) & 1);
+  }
+
+  //! The verdict for one message, from its first word.
+  constexpr action decide(uint32_t w0) const noexcept
+  {
+    if (!enabled || !ump_has_group(w0) || ump_group_in_range(w0, first, count))
+      return action::send;
+    return first_is_receivable() ? action::restamp : action::send_unverified;
+  }
+
+  //! The group MIDI 1.0 bytes are converted to (midi1_to_midi2's context
+  //! group): the block's first group, when the endpoint receives it.
+  constexpr uint8_t midi1_group() const noexcept
+  {
+    return (enabled && first_is_receivable()) ? first : 0;
+  }
+};
+
+//! Writes one UMP (bytes: its size) through write(const uint32_t*, int64_t)
+//! with the port's group applied. Calls note(action) when the message is
+//! restamped or sent unverified, so the caller can report it. The caller's
+//! words are never modified.
+template <typename Write, typename Note>
+inline std::errc write_with_group(
+    const ump_output_group& port, const uint32_t* ump, int64_t bytes, Write&& write, Note&& note)
+{
+  switch (port.decide(ump[0]))
+  {
+    case ump_output_group::action::send:
+      return write(ump, bytes);
+
+    case ump_output_group::action::restamp: {
+      uint32_t words[4]{};
+      if (bytes < 4 || bytes > int64_t(sizeof(words)))
+        return std::errc::bad_message;
+      std::copy_n(ump, bytes / 4, words);
+      words[0] = ump_with_group(words[0], port.first);
+      note(ump_output_group::action::restamp);
+      return write(words, bytes);
+    }
+
+    case ump_output_group::action::send_unverified:
+    default:
+      note(ump_output_group::action::send_unverified);
+      return write(ump, bytes);
+  }
 }
 }
