@@ -318,3 +318,90 @@ TEST_CASE("MIDI 1 MTC Quarter Frame Sequence -> MIDI 2 UMP", "[midi_conversion][
     }
   }
 }
+
+// SysEx7 packets for n data bytes: one Complete packet, or Start, Continue..., End.
+static std::vector<uint32_t> make_sysex7_stream(std::size_t n, uint8_t group = 0)
+{
+  std::vector<uint32_t> words;
+  std::size_t pos = 0;
+  do
+  {
+    const std::size_t len = std::min<std::size_t>(6, n - pos);
+    uint8_t status;
+    if (pos == 0)
+      status = (len == n) ? 0x0 : 0x1;
+    else
+      status = (pos + len == n) ? 0x3 : 0x2;
+
+    uint8_t b[6]{};
+    for (std::size_t i = 0; i < len; i++)
+      b[i] = static_cast<uint8_t>((pos + i) & 0x7F);
+
+    words.push_back(
+        (0x3u << 28) | (uint32_t(group) << 24) | (uint32_t(status) << 20) | (uint32_t(len) << 16)
+        | (uint32_t(b[0]) << 8) | b[1]);
+    words.push_back(
+        (uint32_t(b[2]) << 24) | (uint32_t(b[3]) << 16) | (uint32_t(b[4]) << 8) | b[5]);
+    pos += len;
+  } while (pos < n);
+  return words;
+}
+
+TEST_CASE("convert midi2 to midi1: SysEx7 size bounds", "[midi_in][sysex]")
+{
+  // cmidi2 collects the SysEx7 data bytes of one call in a fixed stack buffer
+  // before writing F0 ... F7. Run under ASan: a longer stream must not
+  // overflow it.
+  libremidi::midi2_to_midi1 m1;
+
+  auto convert = [&](const std::vector<uint32_t>& words, std::vector<uint8_t>& out) {
+    out.clear();
+    return m1.convert(
+        words.data(), words.size(), 0, [&](const uint8_t* midi, std::size_t sz, int64_t) {
+      out.assign(midi, midi + sz);
+      return stdx::error{};
+    });
+  };
+
+  auto expected_sysex = [](std::size_t n) {
+    std::vector<uint8_t> v{0xF0};
+    for (std::size_t i = 0; i < n; i++)
+      v.push_back(static_cast<uint8_t>(i & 0x7F));
+    v.push_back(0xF7);
+    return v;
+  };
+
+  std::vector<uint8_t> out;
+
+  SECTION("500 data bytes convert")
+  {
+    REQUIRE(convert(make_sysex7_stream(500), out) == stdx::error{});
+    REQUIRE(out == expected_sysex(500));
+  }
+
+  SECTION("1024 data bytes, the buffer size, convert")
+  {
+    REQUIRE(convert(make_sysex7_stream(1024), out) == stdx::error{});
+    REQUIRE(out == expected_sysex(1024));
+  }
+
+  SECTION("1025 data bytes are refused")
+  {
+    REQUIRE(convert(make_sysex7_stream(1025), out) != stdx::error{});
+    REQUIRE(out.empty());
+  }
+
+  SECTION("1100 data bytes are refused")
+  {
+    REQUIRE(convert(make_sysex7_stream(1100), out) != stdx::error{});
+    REQUIRE(out.empty());
+  }
+
+  SECTION("a packet claiming more than 6 bytes yields at most 6")
+  {
+    // SysEx7 Complete, byte count nibble 0xF (valid range is 0-6).
+    std::vector<uint32_t> words{0x300F0102, 0x03040506};
+    REQUIRE(convert(words, out) == stdx::error{});
+    REQUIRE(out == std::vector<uint8_t>{0xF0, 1, 2, 3, 4, 5, 6, 0xF7});
+  }
+}
