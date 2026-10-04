@@ -23,10 +23,22 @@ public:
 
   midi_out_impl(libremidi::output_configuration&& conf, winmidi::output_configuration&& apiconf)
       : configuration{std::move(conf), std::move(apiconf)}
-      , m_session{
-            configuration.context ? *configuration.context
-                                  : MidiSession::Create(to_hstring(configuration.client_name))}
   {
+    // No WinRT exception may leave the constructor: when the session cannot be
+    // created the object stays in its not-ready state (client_open_ is
+    // not_connected), and open_port refuses.
+    std::string error;
+    if (!this->self->ready)
+      error = "Windows MIDI Services is not available";
+    else
+      m_session = make_session(configuration.context, configuration.client_name, error);
+
+    if (!m_session)
+    {
+      libremidi_handle_error(this->configuration, "winmidi: cannot create a MIDI session: " + error);
+      return;
+    }
+
     this->client_open_ = stdx::error{};
   }
 
@@ -43,32 +55,56 @@ public:
     if (!device_id)
       return std::errc::invalid_argument;
 
-    auto [ep, gp] = get_port(*device_id, port.port);
-    if (!ep || !gp)
-      return std::errc::address_not_available;
-
-    // The service has no destination parameter: the group in each message
-    // selects the cable. See ump_output_group for the (interim) policy.
-    set_group(
-        {.enabled = true,
-         .first = gp.FirstGroup().Index(),
-         .count = gp.GroupCount(),
-         .receivable = receivable_groups(ep)});
+    if (!m_session)
+      return std::errc::not_connected;
 
     try
     {
+      auto [ep, gp] = get_port(*device_id, port.port);
+      if (!ep || !gp)
+        return std::errc::address_not_available;
+
+      const auto first_group = gp.FirstGroup();
+      if (!first_group)
+        return std::errc::address_not_available;
+
+      // The service has no destination parameter: the group in each message
+      // selects the cable. See ump_output_group for the (interim) policy.
+      set_group(
+          {.enabled = true,
+           .first = first_group.Index(),
+           .count = gp.GroupCount(),
+           .receivable = receivable_groups(ep)});
+
       m_endpoint = m_session.CreateEndpointConnection(ep.EndpointDeviceId());
       if (!m_endpoint)
+      {
+        abandon_open();
         return std::errc::device_or_resource_busy;
+      }
   #if LIBREMIDI_WINMIDI_HAS_COM_EXTENSIONS
-      m_endpoint.as(libremidi::IID_IMidiEndpointConnectionRaw, m_raw_endpoint.put_void());
+      if (FAILED(m_endpoint.as(libremidi::IID_IMidiEndpointConnectionRaw, m_raw_endpoint.put_void()))
+          || !m_raw_endpoint)
+      {
+        abandon_open();
+        return std::errc::io_error;
+      }
     #endif
-      m_endpoint.Open();
+
+      // [noexcept] in the projection: a failure comes back as false.
+      if (!m_endpoint.Open())
+      {
+        abandon_open();
+        return std::errc::io_error;
+      }
 
       return stdx::error{};
     }
     catch (...)
     {
+      libremidi_handle_error(
+          this->configuration, "winmidi: cannot open the output port: " + current_exception_message());
+      abandon_open();
       return std::errc::io_error;
     }
   }
@@ -77,32 +113,47 @@ public:
   stdx::error open_virtual_port(std::string_view port_name) override
   {
     // Create endpoint information for the virtual device
-    using namespace winrt::Microsoft::Windows::Devices::Midi2;
-    using namespace winrt::Microsoft::Windows::Devices::Midi2::Endpoints::Virtual;
+    using namespace winrt::Windows::Devices::Midi2;
+    using namespace winrt::Windows::Devices::Midi2::Enumeration;
+    using namespace winrt::Windows::Devices::Midi2::Transports::Virtual;
 
-    auto conf = setup_virtualdevice_config(configuration.client_name, port_name, port_name, MidiFunctionBlockDirection::BlockOutput);
-
-    // A virtual port sends every message as given.
-    set_group({});
-
-    m_virtual = MidiVirtualDeviceManager::CreateVirtualDevice(conf);
-    if (m_virtual == nullptr)
-      return std::errc::device_or_resource_busy;
+    if (!m_session)
+      return std::errc::not_connected;
 
     try
     {
-      m_endpoint = m_session.CreateEndpointConnection(m_virtual.DeviceEndpointDeviceId());
-      if (!m_endpoint)
+      auto conf = setup_virtualdevice_config(configuration.client_name, port_name, port_name, MidiFunctionBlockDirection::BlockOutput);
+
+      // A virtual port sends every message as given.
+      set_group({});
+
+      m_virtual = MidiVirtualDeviceManager::CreateVirtualDevice(conf);
+      if (m_virtual == nullptr)
         return std::errc::device_or_resource_busy;
 
-      m_endpoint.AddMessageProcessingPlugin(m_virtual);
+      m_endpoint = m_session.CreateEndpointConnection(m_virtual.DeviceEndpointDeviceId());
+      if (!m_endpoint)
+      {
+        abandon_open();
+        return std::errc::device_or_resource_busy;
+      }
 
-      m_endpoint.Open();
+      (void)m_endpoint.AddMessageProcessingPlugin(m_virtual);
+
+      if (!m_endpoint.Open())
+      {
+        abandon_open();
+        return std::errc::io_error;
+      }
 
       return stdx::error{};
     }
     catch (...)
     {
+      libremidi_handle_error(
+          this->configuration,
+          "winmidi: cannot open the virtual output port: " + current_exception_message());
+      abandon_open();
       return std::errc::io_error;
     }
   }
@@ -113,39 +164,51 @@ public:
     if(!m_endpoint)
       return std::errc::not_connected;
 
-    m_session.DisconnectEndpointConnection(m_endpoint.ConnectionId());
-    set_group({});
-#if LIBREMIDI_WINMIDI_HAS_VIRTUAL_DEVICE
-    if (m_virtual)
+    try
     {
-      m_virtual.Cleanup();
-      m_virtual = nullptr;
-    }
+      m_session.DisconnectEndpointConnection(m_endpoint.ConnectionId());
+      set_group({});
+#if LIBREMIDI_WINMIDI_HAS_VIRTUAL_DEVICE
+      if (m_virtual)
+      {
+        m_virtual.Cleanup();
+        m_virtual = nullptr;
+      }
   #endif
+    }
+    catch (...)
+    {
+      libremidi_handle_error(
+          this->configuration, "winmidi: cannot close the output port: " + current_exception_message());
+      return std::errc::io_error;
+    }
     return stdx::error{};
   }
 
   std::errc write_raw(const uint32_t* ump, int64_t bytes)
   {
 #if LIBREMIDI_WINMIDI_HAS_COM_EXTENSIONS
+    if (!m_raw_endpoint)
+      return std::errc::not_connected;
+
     HRESULT ret{};
     switch (bytes / 4)
     {
       case 1:
-        assert(m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(1, (UINT32*)ump));
-        ret = m_raw_endpoint->SendMidiMessagesRaw(0, 1, (UINT32*)ump);
+        assert(m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(1, ump));
+        ret = m_raw_endpoint->SendMidiMessagesRaw(0, 1, ump);
         break;
       case 2:
-        assert(m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(2, (UINT32*)ump));
-        ret = m_raw_endpoint->SendMidiMessagesRaw(0, 2, (UINT32*)ump);
+        assert(m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(2, ump));
+        ret = m_raw_endpoint->SendMidiMessagesRaw(0, 2, ump);
         break;
       case 3:
-        assert(m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(3, (UINT32*)ump));
-        ret = m_raw_endpoint->SendMidiMessagesRaw(0, 3, (UINT32*)ump);
+        assert(m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(3, ump));
+        ret = m_raw_endpoint->SendMidiMessagesRaw(0, 3, ump);
         break;
       case 4:
-        assert(m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(4, (UINT32*)ump));
-        ret = m_raw_endpoint->SendMidiMessagesRaw(0, 4, (UINT32*)ump);
+        assert(m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(4, ump));
+        ret = m_raw_endpoint->SendMidiMessagesRaw(0, 4, ump);
         break;
       default:
         return std::errc::bad_message;
@@ -160,24 +223,34 @@ public:
 
   std::errc write(const uint32_t* ump, int64_t bytes)
   {
+    if (!m_endpoint)
+      return std::errc::not_connected;
+
     MidiSendMessageResults ret{};
-    switch (bytes / 4)
+    try
     {
-      case 1:
-        ret = m_endpoint.SendSingleMessagePacket(MidiMessage32(0, ump[0]));
-        break;
-      case 2:
-        ret = m_endpoint.SendSingleMessagePacket(MidiMessage64(0, ump[0], ump[1]));
-        break;
-      case 3:
-        ret = m_endpoint.SendSingleMessagePacket(MidiMessage96(0, ump[0], ump[1], ump[2]));
-        break;
-      case 4:
-        ret = m_endpoint.SendSingleMessagePacket(
-            MidiMessage128(0, ump[0], ump[1], ump[2], ump[3]));
-        break;
-      default:
-        return std::errc::bad_message;
+      switch (bytes / 4)
+      {
+        case 1:
+          ret = m_endpoint.SendSingleMessagePacket(MidiMessage32(0, ump[0]));
+          break;
+        case 2:
+          ret = m_endpoint.SendSingleMessagePacket(MidiMessage64(0, ump[0], ump[1]));
+          break;
+        case 3:
+          ret = m_endpoint.SendSingleMessagePacket(MidiMessage96(0, ump[0], ump[1], ump[2]));
+          break;
+        case 4:
+          ret = m_endpoint.SendSingleMessagePacket(
+              MidiMessage128(0, ump[0], ump[1], ump[2], ump[3]));
+          break;
+        default:
+          return std::errc::bad_message;
+      }
+    }
+    catch (...)
+    {
+      return std::errc::io_error;
     }
     if (ret != MidiSendMessageResults::Succeeded)
       return std::errc::io_error;
@@ -222,19 +295,27 @@ private:
   {
     uint16_t mask = 0;
     const auto fbs = ep.GetDeclaredFunctionBlocks();
-    if (fbs.Size() > 0)
+    if (fbs && fbs.Size() > 0)
     {
       for (const auto& fb : fbs)
-        if (fb.Direction() != MidiFunctionBlockDirection::BlockOutput)
-          mask = static_cast<uint16_t>(
-              mask | ump_group_mask(fb.FirstGroup().Index(), fb.GroupCount()));
+      {
+        if (!fb)
+          continue;
+        const auto first = fb.FirstGroup();
+        if (first && fb.Direction() != MidiFunctionBlockDirection::BlockOutput)
+          mask = static_cast<uint16_t>(mask | ump_group_mask(first.Index(), fb.GroupCount()));
+      }
     }
-    else
+    else if (const auto gtbs = ep.GetGroupTerminalBlocks())
     {
-      for (const auto& gtb : ep.GetGroupTerminalBlocks())
-        if (gtb.Direction() != MidiGroupTerminalBlockDirection::BlockOutput)
-          mask = static_cast<uint16_t>(
-              mask | ump_group_mask(gtb.FirstGroup().Index(), gtb.GroupCount()));
+      for (const auto& gtb : gtbs)
+      {
+        if (!gtb)
+          continue;
+        const auto first = gtb.FirstGroup();
+        if (first && gtb.Direction() != MidiGroupTerminalBlockDirection::BlockOutput)
+          mask = static_cast<uint16_t>(mask | ump_group_mask(first.Index(), gtb.GroupCount()));
+      }
     }
     return mask;
   }
@@ -276,13 +357,39 @@ private:
   bool m_reported_restamp{};
   bool m_reported_unverified{};
 
-  MidiSession m_session;
-  winrt::Microsoft::Windows::Devices::Midi2::MidiEndpointConnection m_endpoint{nullptr};
+  //! Undoes a failed open: nothing is left registered with the service.
+  void abandon_open() noexcept
+  {
+    try
+    {
+      if (m_endpoint)
+        m_session.DisconnectEndpointConnection(m_endpoint.ConnectionId());
+#if LIBREMIDI_WINMIDI_HAS_VIRTUAL_DEVICE
+      if (m_virtual)
+        m_virtual.Cleanup();
+#endif
+    }
+    catch (...)
+    {
+    }
+
+    m_endpoint = nullptr;
+#if LIBREMIDI_WINMIDI_HAS_COM_EXTENSIONS
+    m_raw_endpoint = nullptr;
+#endif
+#if LIBREMIDI_WINMIDI_HAS_VIRTUAL_DEVICE
+    m_virtual = nullptr;
+#endif
+    set_group({});
+  }
+
+  MidiSession m_session{nullptr};
+  winrt::Windows::Devices::Midi2::MidiEndpointConnection m_endpoint{nullptr};
 #if LIBREMIDI_WINMIDI_HAS_COM_EXTENSIONS
   winrt::impl::com_ref<IMidiEndpointConnectionRaw> m_raw_endpoint{};
 #endif
 #if LIBREMIDI_WINMIDI_HAS_VIRTUAL_DEVICE
-  winrt::Microsoft::Windows::Devices::Midi2::Endpoints::Virtual::MidiVirtualDevice m_virtual{nullptr};
+  winrt::Windows::Devices::Midi2::Transports::Virtual::MidiVirtualDevice m_virtual{nullptr};
 #endif
 };
 

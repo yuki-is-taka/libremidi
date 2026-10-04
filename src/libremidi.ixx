@@ -93,9 +93,9 @@ module;
   #endif
 
   #if defined(LIBREMIDI_WINMIDI)
-    #include <winrt/Microsoft.Windows.Devices.Midi2.h>
+    #include <winrt/Windows.Devices.Midi2.h>
+    #include <winrt/Windows.Devices.Midi2.Enumeration.h>
     #include <WindowsMidiServicesAppSdkComExtensions.h>
-    #include <init/Microsoft.Windows.Devices.Midi2.Initialization.hpp>
   #endif
 #endif
 
