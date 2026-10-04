@@ -14,6 +14,7 @@ struct port_info
 
 class observer_impl final
     : public observer_api
+    , public error_handler
     , public winmidi_shared_data
 {
 public:
@@ -41,11 +42,24 @@ public:
     if (!configuration.has_callbacks())
       return;
 
+    // Without Windows MIDI Services there is nothing to watch: stay without a watcher.
+    if (!this->self->ready)
+    {
+      libremidi_handle_error(configuration, "winmidi: Windows MIDI Services is not available");
+      return;
+    }
+
     // Note: winmidi also notifies for existing devices, so the "notify in constructor"
     // is handled in the callbacks
-    if ((watcher = MidiEndpointDeviceWatcher::Create()))
+    try
     {
-      namespace enumeration = winrt::Windows::Devices::Enumeration;
+      watcher = MidiEndpointDeviceWatcher::Create();
+      if (!watcher)
+      {
+        libremidi_handle_error(configuration, "winmidi: cannot create the endpoint device watcher");
+        return;
+      }
+
       auto addHandler = foundation::TypedEventHandler<
           MidiEndpointDeviceWatcher, MidiEndpointDeviceInformationAddedEventArgs>(
           this, &observer_impl::on_device_added);
@@ -61,6 +75,17 @@ public:
       m_delHandler = watcher.Removed(winrt::auto_revoke, delHandler);
 
       watcher.Start();
+    }
+    catch (...)
+    {
+      // Leave the observer without a watcher: no notifications, polling still works.
+      libremidi_handle_error(
+          configuration,
+          "winmidi: cannot start the endpoint device watcher: " + current_exception_message());
+      m_addHandler.revoke();
+      m_updHandler.revoke();
+      m_delHandler.revoke();
+      watcher = nullptr;
     }
   }
 
@@ -101,7 +126,8 @@ public:
   auto to_port_info(const MidiEndpointDeviceInformation& p, const auto& gp)
       const noexcept -> std::conditional_t<Input, input_port, output_port>
   {
-    const auto& tinfo = p.GetTransportSuppliedInfo();
+    // The projection answers a failed call with null.
+    const auto tinfo = p.GetTransportSuppliedInfo();
 
     return {
         {.api = libremidi::API::WINDOWS_MIDI_SERVICES,
@@ -109,13 +135,13 @@ public:
          .container = std::bit_cast<libremidi::uuid>(p.ContainerId()),
          .device = to_string(p.EndpointDeviceId()),
          .port = gp.Number(),
-         .manufacturer = to_string(tinfo.ManufacturerName),
-         .product = to_string(tinfo.Name),
-         .serial = to_string(tinfo.SerialNumber),
+         .manufacturer = tinfo ? to_string(tinfo.ManufacturerName()) : std::string{},
+         .product = tinfo ? to_string(tinfo.Name()) : std::string{},
+         .serial = tinfo ? to_string(tinfo.SerialNumber()) : std::string{},
          .device_name = to_string(p.Name()),
          .port_name = to_string(gp.Name()),
          .display_name = to_string(gp.Name()) + " " + std::to_string(gp.Number()),
-         .type = code_to_type(to_string(p.GetTransportSuppliedInfo().TransportCode))}};
+         .type = tinfo ? code_to_type(to_string(tinfo.TransportCode())) : transport_type::unknown}};
   }
 
   //! The transport comes from the endpoint's transport code, so it is only
@@ -141,26 +167,43 @@ public:
   {
     std::vector<libremidi::input_port> ret;
 
-    for (const auto& ep : MidiEndpointDeviceInformation::FindAll())
+    try
     {
-      if (ep.Name().starts_with(L"Diagnostics"))
-      {
-        continue;
-      }
+      const auto eps = MidiEndpointDeviceInformation::FindAll();
+      if (!eps)
+        return ret;
 
-      for (const auto& gp : ep.GetDeclaredFunctionBlocks())
+      for (const auto& ep : eps)
       {
-        if (gp.Direction() != MidiFunctionBlockDirection::BlockOutput)
-          if (auto p = wanted_port<true>(ep, gp))
-            ret.emplace_back(std::move(*p));
-      }
+        if (!ep || ep.Name().starts_with(L"Diagnostics"))
+        {
+          continue;
+        }
 
-      for (const auto& gp : ep.GetGroupTerminalBlocks())
-      {
-        if (gp.Direction() != MidiGroupTerminalBlockDirection::BlockOutput)
-          if (auto p = wanted_port<true>(ep, gp))
-            ret.emplace_back(std::move(*p));
+        if (const auto fbs = ep.GetDeclaredFunctionBlocks())
+        {
+          for (const auto& gp : fbs)
+          {
+            if (gp && gp.Direction() != MidiFunctionBlockDirection::BlockOutput)
+              if (auto p = wanted_port<true>(ep, gp))
+                ret.emplace_back(std::move(*p));
+          }
+        }
+
+        if (const auto gtbs = ep.GetGroupTerminalBlocks())
+        {
+          for (const auto& gp : gtbs)
+          {
+            if (gp && gp.Direction() != MidiGroupTerminalBlockDirection::BlockOutput)
+              if (auto p = wanted_port<true>(ep, gp))
+                ret.emplace_back(std::move(*p));
+          }
+        }
       }
+    }
+    catch (...)
+    {
+      // Return what was collected.
     }
 
     return ret;
@@ -170,26 +213,43 @@ public:
   {
     std::vector<libremidi::output_port> ret;
 
-    for (const auto& ep : MidiEndpointDeviceInformation::FindAll())
+    try
     {
-      if (ep.Name().starts_with(L"Diagnostics"))
-      {
-        continue;
-      }
+      const auto eps = MidiEndpointDeviceInformation::FindAll();
+      if (!eps)
+        return ret;
 
-      for (const auto& gp : ep.GetDeclaredFunctionBlocks())
+      for (const auto& ep : eps)
       {
-        if (gp.Direction() != MidiFunctionBlockDirection::BlockInput)
-          if (auto p = wanted_port<false>(ep, gp))
-            ret.emplace_back(std::move(*p));
-      }
+        if (!ep || ep.Name().starts_with(L"Diagnostics"))
+        {
+          continue;
+        }
 
-      for (const auto& gp : ep.GetGroupTerminalBlocks())
-      {
-        if (gp.Direction() != MidiGroupTerminalBlockDirection::BlockInput)
-          if (auto p = wanted_port<false>(ep, gp))
-            ret.emplace_back(std::move(*p));
+        if (const auto fbs = ep.GetDeclaredFunctionBlocks())
+        {
+          for (const auto& gp : fbs)
+          {
+            if (gp && gp.Direction() != MidiFunctionBlockDirection::BlockInput)
+              if (auto p = wanted_port<false>(ep, gp))
+                ret.emplace_back(std::move(*p));
+          }
+        }
+
+        if (const auto gtbs = ep.GetGroupTerminalBlocks())
+        {
+          for (const auto& gp : gtbs)
+          {
+            if (gp && gp.Direction() != MidiGroupTerminalBlockDirection::BlockInput)
+              if (auto p = wanted_port<false>(ep, gp))
+                ret.emplace_back(std::move(*p));
+          }
+        }
       }
+    }
+    catch (...)
+    {
+      // Return what was collected.
     }
 
     return ret;
@@ -199,25 +259,63 @@ public:
   void on_device_added(
       const MidiEndpointDeviceWatcher&, const MidiEndpointDeviceInformationAddedEventArgs& result)
   {
-    add_device(result.AddedDevice());
+    try
+    {
+      add_device(result.AddedDevice());
+    }
+    catch (...)
+    {
+      report_notification_failure();
+    }
   }
 
   void on_device_updated(
       const MidiEndpointDeviceWatcher&,
       const MidiEndpointDeviceInformationUpdatedEventArgs& result)
   {
-    // OPTIMIZEME
-    remove_device(result.EndpointDeviceId());
+    try
+    {
+      // The event hands over the device itself.
+      const auto dev = result.UpdatedDevice();
+      if (!dev)
+        return;
 
-    add_device(
-        MidiEndpointDeviceInformation::CreateFromEndpointDeviceId(result.EndpointDeviceId()));
+      // OPTIMIZEME
+      remove_device(dev.EndpointDeviceId());
+      add_device(dev);
+    }
+    catch (...)
+    {
+      report_notification_failure();
+    }
   }
 
   void on_device_removed(
       const MidiEndpointDeviceWatcher&,
       const MidiEndpointDeviceInformationRemovedEventArgs& result)
   {
-    remove_device(result.EndpointDeviceId());
+    try
+    {
+      if (const auto dev = result.RemovedDevice())
+        remove_device(dev.EndpointDeviceId());
+    }
+    catch (...)
+    {
+      report_notification_failure();
+    }
+  }
+
+  void report_notification_failure() const noexcept
+  {
+    try
+    {
+      libremidi_handle_error(
+          configuration,
+          "winmidi: failed to handle a device notification: " + current_exception_message());
+    }
+    catch (...)
+    {
+    }
   }
 
   void add_block(const MidiEndpointDeviceInformation& ep, const auto& gp)
@@ -270,13 +368,24 @@ public:
 
   void add_device(const MidiEndpointDeviceInformation& ep)
   {
-    for (const auto& fb : ep.GetDeclaredFunctionBlocks())
+    if (!ep)
+      return;
+
+    if (const auto fbs = ep.GetDeclaredFunctionBlocks())
     {
-      add_block(ep, fb);
+      for (const auto& fb : fbs)
+      {
+        if (fb)
+          add_block(ep, fb);
+      }
     }
-    for (const auto& gp : ep.GetGroupTerminalBlocks())
+    if (const auto gtbs = ep.GetGroupTerminalBlocks())
     {
-      add_block(ep, gp);
+      for (const auto& gp : gtbs)
+      {
+        if (gp)
+          add_block(ep, gp);
+      }
     }
   }
 

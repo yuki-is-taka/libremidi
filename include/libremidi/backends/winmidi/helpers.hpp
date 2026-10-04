@@ -10,6 +10,9 @@
 #include <libremidi/detail/memory.hpp>
 
 #include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <exception>
 #include <string>
 #include <guiddef.h>
 #include <unknwn.h>
@@ -17,10 +20,11 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Devices.Enumeration.h>
-#include <winrt/Microsoft.Windows.Devices.Midi2.h>
-#if __has_include(<winrt/Microsoft.Windows.Devices.Midi2.Endpoints.Virtual.h>)
+#include <winrt/Windows.Devices.Midi2.h>
+#include <winrt/Windows.Devices.Midi2.Enumeration.h>
+#if __has_include(<winrt/Windows.Devices.Midi2.Transports.Virtual.h>)
 #define LIBREMIDI_WINMIDI_HAS_VIRTUAL_DEVICE 1
-#include <winrt/Microsoft.Windows.Devices.Midi2.Endpoints.Virtual.h>
+#include <winrt/Windows.Devices.Midi2.Transports.Virtual.h>
 #endif
 #include <libremidi/cmidi2.hpp>
 
@@ -34,15 +38,12 @@
 NAMESPACE_LIBREMIDI {
   LIBREMIDI_DEFINE_GUID_CONSTEXPR(IID, IID_IMidiEndpointConnectionMessagesReceivedCallback, 0x8087b303, 0x0519, 0x31d1, 0x31, 0xd1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10);
   LIBREMIDI_DEFINE_GUID_CONSTEXPR(IID, IID_IMidiEndpointConnectionRaw,                      0x8087b303, 0x0519, 0x31d1, 0x31, 0xd1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20);
-  LIBREMIDI_DEFINE_GUID_CONSTEXPR(IID, IID_IMidiClientInitializer,                          0x8087b303, 0xd551, 0xbce2, 0x1e, 0xad, 0xa2, 0x50, 0x0d, 0x50, 0xc5, 0x80);
-  LIBREMIDI_DEFINE_GUID_CONSTEXPR(IID, IID_MidiClientInitializerUuid,                       0xc3263827, 0xc3b0, 0xbdbd, 0x25, 0x00, 0xce, 0x63, 0xa3, 0xf3, 0xf2, 0xc3);
-  LIBREMIDI_DEFINE_GUID_CONSTEXPR(IID, IID_MidiSrvTransportUuid,                            0x2ba15e4e, 0x5417, 0x4a66, 0x85, 0xb8, 0x2b, 0x22, 0x60, 0xef, 0xbc, 0x84);
 }
 #endif
 
 // clang-format on
 
-namespace midi2 = winrt::Microsoft::Windows::Devices::Midi2;
+namespace midi2 = winrt::Windows::Devices::Midi2;
 namespace foundation = winrt::Windows::Foundation;
 
 NAMESPACE_LIBREMIDI::winmidi
@@ -51,7 +52,8 @@ using namespace winrt;
 using namespace winrt::Windows::Foundation;
 using namespace winrt::Windows::Devices::Enumeration;
 using namespace winrt::Windows::Storage::Streams;
-using namespace winrt::Microsoft::Windows::Devices::Midi2;
+using namespace winrt::Windows::Devices::Midi2;
+using namespace winrt::Windows::Devices::Midi2::Enumeration;
 
 inline bool ichar_equals(char a, char b)
 {
@@ -64,23 +66,90 @@ inline bool iequals(std::string_view lhs, std::string_view rhs)
   return std::ranges::equal(lhs, rhs, ichar_equals);
 }
 
-inline std::pair<
-    winrt::Microsoft::Windows::Devices::Midi2::MidiEndpointDeviceInformation,
-    winrt::Microsoft::Windows::Devices::Midi2::MidiGroupTerminalBlock>
-get_port(const std::string& device_name, int group_terminal_block)
+//! A description of the exception being handled, for error reports.
+//! Must be called from inside a catch block.
+inline std::string current_exception_message() noexcept
+{
+  try
+  {
+    try
+    {
+      throw;
+    }
+    catch (const winrt::hresult_error& e)
+    {
+      char code[16]{};
+      std::snprintf(
+          code, sizeof(code), "0x%08X",
+          static_cast<unsigned>(static_cast<std::int32_t>(e.code())));
+      return std::string{code} + " " + winrt::to_string(e.message());
+    }
+    catch (const std::exception& e)
+    {
+      return e.what();
+    }
+    catch (...)
+    {
+      return "unknown exception";
+    }
+  }
+  catch (...)
+  {
+    return {};
+  }
+}
+
+//! Creates the MIDI session, or returns a null session when that is not possible.
+//! This never lets a WinRT or standard exception escape: the reason is put in `error`.
+//! Most of the API is [noexcept] and answers failures with null, but looking up the
+//! activation factory throws when the runtime is missing.
+inline MidiSession make_session(
+    MidiSession* context, const std::string& client_name, std::string& error)
+{
+  try
+  {
+    if (context)
+      return *context;
+
+    auto session = MidiSession::Create(winrt::to_hstring(client_name));
+    if (!session)
+      error = "MidiSession::Create returned null";
+    return session;
+  }
+  catch (...)
+  {
+    error = current_exception_message();
+    return MidiSession{nullptr};
+  }
+}
+
+//! Every pointer-like thing the service hands out may be null: the projection
+//! turns a failed call into null instead of an exception. Callers must check.
+inline std::pair<MidiEndpointDeviceInformation, MidiGroupTerminalBlock>
+get_port(const std::string& device_name, libremidi::port_handle group_terminal_block)
 {
   auto eps = MidiEndpointDeviceInformation::FindAll();
+  if (!eps)
+    return {nullptr, nullptr};
+
   for (const auto& ep : eps)
   {
+    if (!ep)
+      continue;
+
     auto str = to_string(ep.EndpointDeviceId());
     if (str.empty())
       continue;
 
     if (iequals(str, device_name))
     {
-      for (const auto& gp : ep.GetGroupTerminalBlocks())
+      auto gtbs = ep.GetGroupTerminalBlocks();
+      if (!gtbs)
+        continue;
+
+      for (const auto& gp : gtbs)
       {
-        if (gp.Number() == group_terminal_block)
+        if (gp && gp.Number() == group_terminal_block)
         {
           return std::make_pair(ep, gp);
         }
@@ -90,122 +159,32 @@ get_port(const std::string& device_name, int group_terminal_block)
   return {nullptr, nullptr};
 }
 
-// From Microsoft.Windows.Devices.Midi2.Initialization.hpp
-typedef enum
-{
-  Platform_x64 = 1,
-  //    Platform_Arm64 = 2,
-  //    Platform_Arm64EC = 3,
-  Platform_Arm64X = 4,
-} MidiAppSDKPlatform;
-
-struct IMidiClientInitializer : ::IUnknown
-{
-  // returns the SDK version info. Supply nullptr for arguments you don't care about
-  STDMETHOD(GetInstalledWindowsMidiServicesSdkVersion)(
-      MidiAppSDKPlatform* buildPlatform,
-      USHORT* versionMajor,
-      USHORT* versionMinor,
-      USHORT* versionPatch,
-
-      LPWSTR* buildSource,
-      LPWSTR* versionName,
-      LPWSTR* versionFullString
-      ) = 0;
-
-  // demand-starts the service if present
-  STDMETHOD(EnsureServiceAvailable)() = 0;
-};
+//! Whether Windows MIDI Services can be used:
+//! - the Windows.Devices.Midi2 activation factory can be reached (in-box, or the
+//!   app-local Windows.Devices.Midi2.dll + .pri), and
+//! - the selected API mode is the full Windows MIDI Services mode (in the legacy
+//!   modes the classes activate, but the service is not in use), and
+//! - the service is running or can be demand-started.
+//! Nothing escapes from here, whatever fails.
 struct winmidi_shared_data_instance
 {
-  IMidiClientInitializer* initializer{nullptr};
   bool ready{false};
-  winmidi_shared_data_instance()
+
+  winmidi_shared_data_instance() noexcept
   {
-    // 1. Check if MIDI Services are available
+    try
     {
-      ::IUnknown* servicePointer{ nullptr };
-      auto hr = CoCreateInstance(
-          libremidi::IID_MidiSrvTransportUuid,
-          NULL,
-          CLSCTX_INPROC_SERVER,
-          IID_PPV_ARGS(&servicePointer)
-          );
-
-      if (SUCCEEDED(hr))
-      {
-        if (servicePointer == nullptr)
-        {
-          ready = false;
-          return;
-        }
-
-        // Here is the good case:
-        servicePointer->Release();
-        servicePointer = nullptr;
-        ready = true;
-      }
-      else if (hr == REGDB_E_CLASSNOTREG)
-      {
-        servicePointer = nullptr;
-        ready = false;
+      if (!winrt::try_get_activation_factory<MidiApi, IMidiApiStatics>())
         return;
-      }
-      else
-      {
-        servicePointer = nullptr;
-        ready = false;
-        return;
-      }
-    }
 
-    // 2. Check if MIDI services can be created
-    {
-      if (SUCCEEDED(CoCreateInstance(
-              libremidi::IID_MidiClientInitializerUuid,
-              NULL,
-              CLSCTX::CLSCTX_INPROC_SERVER | CLSCTX::CLSCTX_FROM_DEFAULT_CONTEXT,
-              libremidi::IID_IMidiClientInitializer,
-              reinterpret_cast<void**>(&initializer)
-              )))
-      {
-        if (initializer != nullptr)
-        {
-          ready = true;
-        }
-        else
-        {
-          ready = false;
-          return;
-        }
-      }
-      else
-      {
-        ready = false;
+      if (MidiApi::GetCurrentlySelectedApiMode() != MidiApiMode::FullWindowsMidiServicesMode)
         return;
-      }
-    }
 
-    // 3. Check if MIDI services can be used
-    if (SUCCEEDED(initializer->EnsureServiceAvailable()))
-    {
-      ready = true;
+      ready = MidiApi::EnsureServiceAvailable();
     }
-    else
+    catch (...)
     {
       ready = false;
-      initializer->Release();
-      initializer = nullptr;
-      return;
-    }
-  }
-
-  ~winmidi_shared_data_instance()
-  {
-    if (initializer != nullptr)
-    {
-      initializer->Release();
-      initializer = nullptr;
     }
   }
 };
@@ -224,25 +203,27 @@ struct winmidi_shared_data
 };
 
 
-inline winrt::Microsoft::Windows::Devices::Midi2::Endpoints::Virtual::MidiVirtualDeviceCreationConfig setup_virtualdevice_config(
+#if LIBREMIDI_WINMIDI_HAS_VIRTUAL_DEVICE
+inline winrt::Windows::Devices::Midi2::Transports::Virtual::MidiVirtualDeviceCreationConfig setup_virtualdevice_config(
     std::string_view manufacturer_name,
     std::string_view product_id,
     std::string_view port_name,
     MidiFunctionBlockDirection direction)
 {
-  using namespace winrt::Microsoft::Windows::Devices::Midi2;
-  using namespace winrt::Microsoft::Windows::Devices::Midi2::Endpoints::Virtual;
+  using namespace winrt::Windows::Devices::Midi2;
+  using namespace winrt::Windows::Devices::Midi2::Enumeration;
+  using namespace winrt::Windows::Devices::Midi2::Transports::Virtual;
 
   MidiDeclaredEndpointInfo endpointInfo;
-  endpointInfo.HasStaticFunctionBlocks = true;
-  endpointInfo.Name = to_hstring(port_name);
-  endpointInfo.ProductInstanceId = to_hstring(product_id);
-  endpointInfo.SupportsMidi10Protocol = true;
-  endpointInfo.SupportsMidi20Protocol = true;
-  endpointInfo.SupportsReceivingJitterReductionTimestamps = false;
-  endpointInfo.SupportsSendingJitterReductionTimestamps = false;
-  endpointInfo.SpecificationVersionMajor = 1;
-  endpointInfo.SpecificationVersionMinor = 1;
+  endpointInfo.HasStaticFunctionBlocks(true);
+  endpointInfo.Name(to_hstring(port_name));
+  endpointInfo.ProductInstanceId(to_hstring(product_id));
+  endpointInfo.SupportsMidi10Protocol(true);
+  endpointInfo.SupportsMidi20Protocol(true);
+  endpointInfo.SupportsReceivingJitterReductionTimestamps(false);
+  endpointInfo.SupportsSendingJitterReductionTimestamps(false);
+  endpointInfo.SpecificationVersionMajor(1);
+  endpointInfo.SpecificationVersionMinor(1);
 
   // Create the virtual device configuration
   if(manufacturer_name.empty())
@@ -267,4 +248,5 @@ inline winrt::Microsoft::Windows::Devices::Midi2::Endpoints::Virtual::MidiVirtua
   return creationConfig;
 
 }
+#endif
 }
